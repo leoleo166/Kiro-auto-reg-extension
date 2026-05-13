@@ -45,7 +45,7 @@ class TimeoutsConfig:
     """Таймауты (оптимизированы для скорости)"""
     page_load: int = 2  # Уменьшено с 3
     element_wait: int = 1  # Уменьшено с 2
-    verification_code: int = 60  # Уменьшено с 90
+    verification_code: int = 180  # AWS Builder ID email arrives 30-120s after submit; 60s was too tight
     oauth_callback: int = 20  # Уменьшено с 30
     between_accounts: int = 1  # Уменьшено с 2
     imap_poll_interval: int = 1  # Уменьшено с 2

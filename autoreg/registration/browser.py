@@ -50,6 +50,9 @@ def find_chrome_path() -> Optional[str]:
         ]
     else:  # Linux
         possible_paths = [
+            # User-local portable Chrome (installed by autoreg setup)
+            os.path.expanduser('~/bin/chrome'),
+            os.path.expanduser('~/opt/chrome-linux64/chrome'),
             '/usr/bin/google-chrome',
             '/usr/bin/google-chrome-stable',
             '/usr/bin/chromium',
@@ -125,6 +128,15 @@ BROWSER_ARGS = [
     '--disable-dev-shm-usage',
 ]
 
+# Route browser traffic through the validator proxy pool if configured.
+# This is needed on hosting IPs (e.g. Russian VPS) where AWS Builder ID
+# signup is geo-blocked or flagged for bot-challenge. The env var is
+# read at module load — set BROWSER_PROXY=http://host:port or
+# socks5://host:port in autoreg/.env or export it before running.
+_BROWSER_PROXY = os.environ.get('BROWSER_PROXY', '').strip()
+if _BROWSER_PROXY:
+    BROWSER_ARGS.append(f'--proxy-server={_BROWSER_PROXY}')
+
 PASSWORD_LENGTH = 16
 PASSWORD_CHARS = {
     'upper': 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
@@ -197,6 +209,15 @@ class BrowserAutomation:
         co.set_argument('--disable-infobars')
         co.set_argument('--no-first-run')
         co.set_argument('--no-default-browser-check')
+
+        # --- Critical: disable AutomationControlled blink-feature ---
+        # Без этого флага navigator.webdriver stub остаётся на прототипе
+        # независимо от наших Proxy-подмен. sannysoft.com "WebDriver (New)"
+        # FAIL падает ровно из-за этого. Комментарий в BROWSER_ARGS утверждает
+        # что "AWS детектит этот флаг!" — это устарело (проверено 2026):
+        # у undetected-chromedriver и у 7836246/aws-builder-id он включён
+        # по умолчанию, и оба проходят AWS дальше нас.
+        co.set_argument('--disable-blink-features=AutomationControlled')
         
         # Force English language to avoid Chinese error messages
         co.set_argument('--lang=en-US')
@@ -286,6 +307,32 @@ class BrowserAutomation:
                 
                 self._spoofer = apply_pre_navigation_spoofing(self.page, profile)
                 print("   [S] Anti-fingerprint spoofing applied")
+
+                # Дополнительный слой: Canvas/WebGL/Audio/Navigator/Screen/WebRTC
+                # spoof (портировано из 7836246/aws-builder-id).
+                # Базовый spoofer накладывает timezone+geo+webdriver-hide, а
+                # этот модуль — уникальные значения Canvas noise/WebGL vendor
+                # на каждом запуске, чтобы fingerprint отличался между
+                # попытками (AWS трекает повторяющиеся fingerprint как
+                # bot-farm).
+                try:
+                    from spoofers.fingerprint_extras import inject_into_drissionpage
+                    if inject_into_drissionpage(self.page):
+                        print("   [FP] Canvas/WebGL/Audio/Nav fingerprint randomized")
+                except Exception as e:
+                    print(f"   [FP] extras failed (non-fatal): {e}")
+
+                # Stealth patches: закрывают 4 headless-detection флага
+                # которые bot.sannysoft.com выявил на нашем стеке
+                # (webdriver leak, Permissions mismatch, plugins not
+                # PluginArray, Notification.permission mismatch).
+                # AWS FWCIM читает эти же сигналы при signup.
+                try:
+                    from spoofers.stealth import inject_stealth
+                    if inject_stealth(self.page):
+                        print("   [ST] Stealth patches applied (webdriver/plugins/permissions)")
+                except Exception as e:
+                    print(f"   [ST] stealth failed (non-fatal): {e}")
             except Exception as e:
                 print(f"   [!] Spoofing failed: {e}")
                 self._spoofer = None
@@ -1132,10 +1179,26 @@ class BrowserAutomation:
         
         # Ожидание страницы верификации
         print("   [...] Waiting for verification page...")
-        verification_selectors = ['text=Verify your email', 'text=Verification code', '@placeholder=6-digit']
+        # AWS Builder ID UI меняется — пробуем широкий набор селекторов,
+        # включая inputmode=numeric и autocomplete=one-time-code, которые
+        # у Builder ID более стабильны чем текст "Verify your email".
+        verification_selectors = [
+            'text=Verify your email',
+            'text=Verification code',
+            'text:Check your email',
+            'text:Enter the code',
+            'text:verification code',
+            '@placeholder=6-digit',
+            '@placeholder*=code',
+            '@autocomplete=one-time-code',
+            '@inputmode=numeric',
+            'css:input[maxlength="6"]',
+            'css:input[maxlength="8"]',
+            'css:input[type="tel"]',
+        ]
         
         start_time = time.time()
-        timeout = 20
+        timeout = 45  # было 20 — AWS после введения name иногда медленно рендерит verify page
         retry_count = 0
         max_retries = 2
         cookie_retry = 0

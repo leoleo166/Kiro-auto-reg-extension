@@ -86,12 +86,22 @@ def detect_ip_geo() -> Optional[IPGeoData]:
     
     Пробует несколько бесплатных API.
     """
-    
+    # Если у браузера сконфигурирован BROWSER_PROXY, IP-детекция должна
+    # идти через тот же прокси — иначе мы получим IP хоста (напр. Moscow
+    # для русского VPS) и построим fingerprint под не тот geo, что видит
+    # AWS по IP из proxy-exit. Это явный red-flag для bot-challenge.
+    import os
+    _proxy = os.environ.get('BROWSER_PROXY', '').strip()
+    proxies = None
+    if _proxy:
+        proxies = {'http': _proxy, 'https': _proxy}
+
     # Попытка 1: ip-api.com (бесплатный, без ключа)
     try:
         resp = requests.get(
             'http://ip-api.com/json/?fields=status,country,countryCode,city,lat,lon,timezone,query',
-            timeout=5
+            timeout=8,
+            proxies=proxies,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -113,7 +123,7 @@ def detect_ip_geo() -> Optional[IPGeoData]:
     
     # Попытка 2: ipapi.co (бесплатный лимит)
     try:
-        resp = requests.get('https://ipapi.co/json/', timeout=5)
+        resp = requests.get('https://ipapi.co/json/', timeout=8, proxies=proxies)
         if resp.status_code == 200:
             data = resp.json()
             tz = data.get('timezone', 'America/New_York')
@@ -133,7 +143,7 @@ def detect_ip_geo() -> Optional[IPGeoData]:
     
     # Попытка 3: ipinfo.io (бесплатный лимит)
     try:
-        resp = requests.get('https://ipinfo.io/json', timeout=5)
+        resp = requests.get('https://ipinfo.io/json', timeout=8, proxies=proxies)
         if resp.status_code == 200:
             data = resp.json()
             tz = data.get('timezone', 'America/New_York')
