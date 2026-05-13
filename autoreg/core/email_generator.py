@@ -6,12 +6,16 @@ Strategies:
 - plus_alias: user+random@domain.com (Gmail, Outlook, etc.)
 - catch_all: random@custom-domain.com (requires catch-all on domain)
 - pool: Use emails from provided list
+- ddg_api: DuckDuckGo Email Protection - calls DDG API per reg,
+  returns infinite <random>@duck.com aliases, all forward to IMAP_USER inbox
 """
 
 import os
 import json
 import random
 import string
+import urllib.request
+import urllib.error
 from typing import Optional, Tuple, List
 from dataclasses import dataclass, field
 
@@ -45,10 +49,11 @@ class EmailResult:
 @dataclass
 class EmailGeneratorConfig:
     """Configuration for email generator"""
-    strategy: str  # 'single', 'plus_alias', 'catch_all', 'pool'
+    strategy: str  # 'single', 'plus_alias', 'catch_all', 'pool', 'ddg_api'
     imap_user: str
     domain: Optional[str] = None  # For catch_all
     email_pool: List[str] = field(default_factory=list)  # For pool strategy
+    ddg_access_token: Optional[str] = None  # For ddg_api strategy
     
 
 class EmailGenerator:
@@ -86,7 +91,8 @@ class EmailGenerator:
             strategy=strategy,
             imap_user=imap_user,
             domain=domain or imap_user.split('@')[1] if '@' in imap_user else '',
-            email_pool=email_pool
+            email_pool=email_pool,
+            ddg_access_token=os.environ.get('DDG_ACCESS_TOKEN', '') or None,
         )
         
         return cls(config)
@@ -103,6 +109,8 @@ class EmailGenerator:
             return self._generate_catch_all()
         elif strategy == 'pool':
             return self._generate_from_pool()
+        elif strategy == 'ddg_api':
+            return self._generate_ddg_api()
         else:
             # Fallback to single
             print(f"[!] Unknown strategy '{strategy}', falling back to 'single'")
@@ -167,6 +175,54 @@ class EmailGenerator:
             display_name=f"{first} {last}"
         )
     
+    def _generate_ddg_api(self) -> EmailResult:
+        """DuckDuckGo Email Protection - generates fresh random@duck.com per call.
+
+        Requires DDG_ACCESS_TOKEN env var (62-char hex token from
+        /api/email/dashboard). IMAP_USER is the gmail account that
+        receives DDG-forwarded mail. Every call hits DDG's API for a
+        unique alias, so AWS sees fresh sender/local part each time.
+        """
+        token = self.config.ddg_access_token
+        if not token:
+            raise ValueError(
+                "DDG_ACCESS_TOKEN env var required for ddg_api strategy"
+            )
+        req = urllib.request.Request(
+            'https://quack.duckduckgo.com/api/email/addresses',
+            method='POST',
+            headers={
+                'Authorization': f'Bearer {token}',
+                'User-Agent': (
+                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; '
+                    'rv:109.0) Gecko/20100101 Firefox/113.0'
+                ),
+                'Accept': 'application/json',
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                if resp.status not in (200, 201):
+                    raise RuntimeError(
+                        f'DDG /addresses HTTP {resp.status}'
+                    )
+                data = json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8', 'replace')
+            raise RuntimeError(
+                f'DDG /addresses HTTPError {e.code}: {body}'
+            ) from e
+        alias = data.get('address')
+        if not alias:
+            raise RuntimeError(f'DDG /addresses bad payload: {data!r}')
+        registration_email = f'{alias}@duck.com'
+        name = self._generate_random_name()
+        return EmailResult(
+            registration_email=registration_email,
+            imap_lookup_email=self.config.imap_user,  # DDG forwards here
+            display_name=name,
+        )
+
     def _generate_from_pool(self) -> EmailResult:
         """Pool mode - use emails from provided list
         
@@ -252,13 +308,19 @@ class EmailGenerator:
     def _generate_alias_suffix(self) -> str:
         """Generate unique suffix for plus alias.
 
-        AWS Builder ID fraud detection flags repeating plus-addressing
-        patterns that share recognisable prefixes (`kiro*`, `auto*`,
-        `test*`). After ~15 attempts on one gmail with a `kiro*` suffix
-        AWS returned generic errors right after the name step. A short
-        numeric suffix mimics how real users tag emails (e.g. +1, +14,
-        +1234) and does not trip alias-pattern heuristics.
+        Используем нейтральный suffix вместо палевного `kiro*` —
+        AWS Builder ID fraud detection маркирует повторяющиеся паттерны
+        plus-addressing с одним и тем же префиксом (особенно тех, которые
+        содержат узнаваемые строки типа 'kiro', 'auto', 'test'). После
+        15+ попыток с одного gmail с префиксом kiro* AWS начал давать
+        generic error после ввода name. Рандомный 6-8 символьный суффикс
+        выглядит как человеческое имя/никнейм и не триггерит эвристики.
         """
+        # Short numeric alias mimics how real users tag emails (e.g. +1, +14, +1234).
+        # Bot fraud detection appears to flag random alphanumeric strings of
+        # 6-9 chars as spam-farm aliasing patterns.
+        # 4 digits gives ~10k uniqueness while still looking human-picked.
+        import string
         n = random.randint(1, 9999)
         return str(n)
     

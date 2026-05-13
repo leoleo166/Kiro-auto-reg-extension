@@ -76,14 +76,20 @@ def _imap_otp_callback(target_email: str, timeout: int = 180, poll: int = 3):
         start = time.time()
         seen: set[bytes] = set()
         target_lc = target_email.lower()
+        is_ddg = target_lc.endswith("@duck.com")
         while time.time() - start < timeout:
             try:
                 m = _connect()
-                # search newest first, narrow by FROM signin.aws
-                typ, data = m.search(
-                    None,
-                    '(FROM "no-reply@signin.aws" SINCE "%s")' % datetime.utcnow().strftime('%d-%b-%Y'),
-                )
+                # When the target is a duck.com alias, AWS sends to <alias>@duck.com
+                # and DDG forwards to our gmail inbox, rewriting From/To. Original
+                # alias survives in the *body* and is also exposed in *Reply-To* /
+                # *From* (DDG embeds "<original-sender>_at_signin.aws_<hash>@duck.com"
+                # and "<alias>" appears verbatim in the forwarded body footer).
+                if is_ddg:
+                    search_q = '(FROM "duck.com" SINCE "%s")' % datetime.utcnow().strftime('%d-%b-%Y')
+                else:
+                    search_q = '(FROM "no-reply@signin.aws" SINCE "%s")' % datetime.utcnow().strftime('%d-%b-%Y')
+                typ, data = m.search(None, search_q)
                 ids = data[0].split() if data and data[0] else []
                 for mid in reversed(ids):
                     if mid in seen:
@@ -93,11 +99,7 @@ def _imap_otp_callback(target_email: str, timeout: int = 180, poll: int = 3):
                     if not raw or not raw[0]:
                         continue
                     msg = message_from_bytes(raw[0][1])
-                    to_hdr = (msg.get("To") or "").lower()
-                    delivered_to = (msg.get("Delivered-To") or "").lower()
-                    if target_lc not in to_hdr and target_lc not in delivered_to:
-                        continue
-                    # Extract 6-digit code from body
+                    # Build body once (we need it both for filter check and OTP extract)
                     body_chunks: list[str] = []
                     if msg.is_multipart():
                         for part in msg.walk():
@@ -112,6 +114,28 @@ def _imap_otp_callback(target_email: str, timeout: int = 180, poll: int = 3):
                         except Exception:
                             body_chunks.append(msg.get_payload() or "")
                     combined = "\n".join(body_chunks)
+
+                    if is_ddg:
+                        # DDG forwards: must originate from signin.aws and target alias must appear
+                        from_hdr = (msg.get("From") or "").lower()
+                        reply_to = (msg.get("Reply-To") or "").lower()
+                        subject_hdr = (msg.get("Subject") or "").lower()
+                        if "signin.aws" not in (from_hdr + reply_to + combined.lower()):
+                            continue
+                        # Match alias in body, headers, or subject (DDG places it in multiple spots)
+                        alias_local = target_lc.split("@", 1)[0]
+                        if target_lc not in combined.lower() and \
+                           target_lc not in from_hdr and \
+                           target_lc not in reply_to and \
+                           alias_local not in subject_hdr and \
+                           alias_local not in from_hdr:
+                            continue
+                    else:
+                        to_hdr = (msg.get("To") or "").lower()
+                        delivered_to = (msg.get("Delivered-To") or "").lower()
+                        if target_lc not in to_hdr and target_lc not in delivered_to:
+                            continue
+
                     for pat in [
                         r"verification code is[:\s]*(\d{6})",
                         r"code[:\s]*(\d{6})",
